@@ -57,6 +57,9 @@ const int DECEL_STEP = 12;        // Slowing down, and crossing zero before a di
 const int KICK_STEP = 30;         // Hop across the dead zone below BEND_MIN_PWM when a forward bend starts
 const int HOLD_TORQUE_PWM = 60;   // Light forward torque kept on at a position instead of dropping to 0
 const long IN_POSITION_WINDOW = 3; // Counts: "target reached" window
+// The arm keeps coasting forward while the PWM ramps down (about 6 counts at bending speed),
+// so when approaching from below, start stopping this many counts early.
+const long FORWARD_ARRIVAL_LEAD_COUNTS = 5;
 
 // Approach speeds
 // Below BEND_MIN_PWM the motor cannot bend the metal (forward = loaded direction),
@@ -67,6 +70,8 @@ const int REVERSE_CORRECT_MIN_PWM = 60; // Gentle floor for reverse corrections 
 // Position command (P<angle>): no sheet metal loaded, so it can run at low PWM in both directions
 const int FREE_MOVE_PWM = 60;      // Cruise PWM
 const int FREE_MOVE_MIN_PWM = 45;  // Slowest PWM near the target (keep above REVERSE_STALL_PWM_THRESHOLD)
+const unsigned long FREE_MOVE_SETTLE_MS = 250; // Arm must be still this long before the position is checked
+const long FREE_MOVE_ACCEPT_COUNTS = 4;        // Settled error accepted without another correction
 const long APPROACH_RAMP_COUNTS = 60;   // Start slowing down inside this many counts (longer = gentler arrival)
 
 // --- Variables ---
@@ -126,6 +131,9 @@ float pendingMoveAngle = 0.0;
 bool freeMoveActive = false;
 int freeMovePasses = 0;
 MotorDIR freeMoveLastDir = STOP;
+bool freeMoveSettling = false;        // Motor ramping down / arm coming to rest before the final check
+long freeMoveSettleLastPos = 0;
+unsigned long freeMoveSettleSince = 0;
 float pendingBendAngle = 0.0;
 const char* pendingBendLabel = "target";
 bool positionControlActive = false;
@@ -294,6 +302,7 @@ void stopMotor() {
   pendingBend = false; // Any stop/abort cancels a queued bend
   pendingMove = false;
   freeMoveActive = false;
+  freeMoveSettling = false;
   positionControlActive = false;
   isHolding = false;
   isDwelling = false;
@@ -307,6 +316,7 @@ void softStopAll() {
   pendingBend = false;
   pendingMove = false;
   freeMoveActive = false;
+  freeMoveSettling = false;
   positionControlActive = false;
   isHolding = false;
   isDwelling = false;
@@ -372,6 +382,7 @@ void startFreeMove(float angle) {
   currentMoveStage = STAGE_IDLE;
   freeMovePasses = 0;
   freeMoveLastDir = STOP;
+  freeMoveSettling = false;
   freeMoveActive = true;
   Serial.print("Moving to position: ");
   Serial.print(angle);
@@ -945,11 +956,16 @@ bool busyScreenDrawn = false;
 void uiService(float currentAngle) {
   uiHandleInput();
 
-  if (isBusy()) {
+  // A redraw blocks the loop (the PWM ramp only advances once per pass), so never redraw
+  // while the motor is driving or still ramping down, including manual F/R moves and the
+  // ramp-down after a move finishes.
+  bool motorActive = (currentDIR != STOP) || (currentPWM > 0) || (outputDIR != STOP);
+
+  if (isBusy() || motorActive) {
     // Draw the running screen once, before the motor gets going, then leave the display
     // alone until the move ends. Redrawing mid-move blocks the loop long enough for the
     // arm to overshoot the target.
-    if (!busyScreenDrawn) {
+    if (!busyScreenDrawn && isBusy()) {
       busyScreenDrawn = true;
       uiDraw(currentAngle);
       lastDisplaySig = 0; // Force a fresh redraw once the move is over
@@ -1126,6 +1142,8 @@ void loop() {
   }
 
   // --- 4a. Free move (P command): unloaded, low PWM, no staging / dwell / hold ---
+  // On arrival the motor ramps down, then the arm is given time to come to rest and the
+  // position is re-checked; any coast-through or drift is corrected before finishing.
   if (freeMoveActive) {
     if (!clampsEngaged) {
       stopMotor();
@@ -1134,12 +1152,46 @@ void loop() {
       long fmError = targetEncoderPos - currentPosition;
       long fmAbs = abs(fmError);
 
-      if (fmAbs <= IN_POSITION_WINDOW) {
-        softStopAll();
-        showMsg("AT POSITION");
-        Serial.print("Position reached. Angle: ");
-        Serial.println(currentAngle, 1);
-      } else {
+      if (freeMoveSettling) {
+        requestMotor(STOP, 0); // Soft stop: PWM keeps ramping down
+
+        if (currentPWM > 0 || abs(currentPosition - freeMoveSettleLastPos) >= 1) {
+          // Still ramping down or still moving: restart the stillness timer
+          freeMoveSettleLastPos = currentPosition;
+          freeMoveSettleSince = millis();
+        } else if (millis() - freeMoveSettleSince >= FREE_MOVE_SETTLE_MS) {
+          if (fmAbs <= FREE_MOVE_ACCEPT_COUNTS) {
+            softStopAll();
+            showMsg("AT POSITION");
+            Serial.print("Position reached. Angle: ");
+            Serial.println(currentAngle, 1);
+          } else if (freeMovePasses < MAX_POSITION_PASSES) {
+            freeMovePasses++;
+            freeMoveSettling = false;
+            Serial.print("Settled off by ");
+            Serial.print(fmAbs);
+            Serial.print(" counts. Correcting (pass ");
+            Serial.print(freeMovePasses);
+            Serial.print("/");
+            Serial.print(MAX_POSITION_PASSES);
+            Serial.println(").");
+          } else {
+            softStopAll();
+            showMsg("POSITION SETTLED");
+            Serial.print("WARNING: Max correction passes reached; stopping (error ");
+            Serial.print(fmAbs);
+            Serial.println(" counts).");
+          }
+        }
+      }
+      else if (fmAbs <= IN_POSITION_WINDOW) {
+        // In the window: ramp down and wait for the arm to come to rest
+        requestMotor(STOP, 0);
+        freeMoveSettling = true;
+        freeMoveSettleLastPos = currentPosition;
+        freeMoveSettleSince = millis();
+      }
+      else {
         MotorDIR fmDir = (fmError > 0) ? FORWARD : REVERSE;
 
         // Direction reversals mean overshoot / hunting: give up after MAX_POSITION_PASSES
@@ -1188,7 +1240,7 @@ void loop() {
     }
     else if (currentMoveStage == STAGE_PAUSE) {
       // Pause between the 75% leg and the final leg: keep light holding torque on
-      holdTorque(targetEncoderPos - currentPosition);
+      requestHoldTorque(HOLD_TORQUE_PWM);
 
       if (millis() - stagePauseTimer >= STAGE_PAUSE_DURATION_MS) {
         targetAngle = finalTargetAngle;
@@ -1203,8 +1255,9 @@ void loop() {
     }
     else if (isDwelling) {
       // Dwell at target to let backlash/springback settle, then re-check.
-      // Holding torque stays on so springback doesn't undo the bend during the dwell.
-      holdTorque(targetEncoderPos - currentPosition);
+      // Light holding torque stays on; no corrective pushes while the arm is still coasting.
+      // The re-check below decides whether a correction pass is needed.
+      requestHoldTorque(HOLD_TORQUE_PWM);
 
       if (millis() - dwellTimer >= DWELL_TIME_MS) {
         isDwelling = false;
@@ -1235,19 +1288,26 @@ void loop() {
       long error = targetEncoderPos - currentPosition;
       long absError = abs(error);
 
-      if (absError <= IN_POSITION_WINDOW) {
+      // Arriving from below at speed: call it "reached" a few counts early so the coast
+      // during ramp-down lands on the target instead of past it.
+      long arrivalWindow = IN_POSITION_WINDOW;
+      if (error > 0 && outputDIR == FORWARD && currentPWM > HOLD_TORQUE_PWM) {
+        arrivalWindow += FORWARD_ARRIVAL_LEAD_COUNTS;
+      }
+
+      if (absError <= arrivalWindow) {
         // Target reached window
         if (currentMoveStage == STAGE_FIRST_LEG) {
           currentMoveStage = STAGE_PAUSE;
           stagePauseTimer = millis();
-          holdTorque(error);
+          requestHoldTorque(HOLD_TORQUE_PWM);
           Serial.println("Reached 75% intermediate target. Pausing...");
         }
         else if (currentMoveStage == STAGE_FINAL_LEG) {
           // Stop and dwell before the final position check / hold
           isDwelling = true;
           dwellTimer = millis();
-          holdTorque(error);
+          requestHoldTorque(HOLD_TORQUE_PWM);
         }
       }
       else {
